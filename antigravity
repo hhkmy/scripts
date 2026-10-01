@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+#
+# antigravity-update.sh
+# Robust updater and installer for Google Antigravity 2.0 (Agentic Desktop) on Linux
+#
+
+set -euo pipefail
+
+# ==================== Configuration ====================
+APP_NAME="Antigravity"
+INSTALL_DIR="${ANTIGRAVITY_INSTALL_DIR:-$HOME/.local/share/antigravity}"
+ICON_DIR="$INSTALL_DIR/icons"
+SYSTEM_ICON_DIR="$HOME/.local/share/icons/hicolor"
+DESKTOP_DIR="$HOME/.local/share/applications"
+BIN_DIR="$HOME/.local/bin"
+BACKUP_DIR="$HOME/.local/share/antigravity-backups"
+CACHE_DIR="$HOME/.cache/antigravity-updater"
+
+BASE_URL="https://storage.googleapis.com/antigravity-public/antigravity-hub"
+DEFAULT_MANIFEST_BASE="https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest"
+MANIFEST_BASE="$DEFAULT_MANIFEST_BASE"
+
+# Known release builds database
+declare -A KNOWN_RELEASES=(
+    ["2.19.1"]="6046815158665216"
+    ["2.18.1"]="4945794252537856"
+    ["2.12.2"]="6298742303883264"
+)
+LATEST_KNOWN_VERSION="2.19.1"
+LATEST_KNOWN_HASH="6046815158665216"
+
+# ==================== Colors & Logging ====================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log_info()  { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+log_ok()    { echo -e "${GREEN}[OK]${NC} $*" >&2; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+# ==================== Usage ====================
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  -c, --check          Check for new version only (do not install)
+  -f, --force          Reinstall even if version is identical / kill running instance
+  -v, --version V      Install a specific version (e.g. 2.19.1)
+      --hash H         Override release execution ID / build hash
+  -k, --keep           Keep all backup files (do not prune older backups)
+  -y, --yes            Non-interactive mode (auto-confirm prompts)
+      --rollback       Restore previous version from latest backup
+  -h, --help           Show this help message
+
+Examples:
+  $0                   # Check and install latest version
+  $0 --check           # Check for new version only
+  $0 --version 2.19.1  # Install specific version
+  $0 --force           # Force reinstall current version
+  $0 --rollback        # Restore previous backup
+EOF
+    exit 0
+}
+
+# ==================== Architecture Detection ====================
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)        echo "linux-x64" ;;
+        aarch64|arm64) echo "linux-arm64" ;;
+        *)             echo "linux-$arch" ;;
+    esac
+}
+
+detect_manifest_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)        echo "x64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)             echo "$arch" ;;
+    esac
+}
+
+# ==================== Version Comparison ====================
+compare_versions() {
+    # Returns 0 if v1 == v2, 1 if v1 > v2, 2 if v1 < v2
+    local v1="$1"
+    local v2="$2"
+    python3 -c "
+import sys, re
+def semver(v):
+    return [int(x) for x in re.findall(r'\d+', v)]
+v1 = semver('$v1')
+v2 = semver('$v2')
+if v1 == v2: sys.exit(0)
+elif v1 > v2: sys.exit(1)
+else: sys.exit(2)
+" 2>/dev/null
+}
+
+# ==================== Running Process Check ====================
+check_running_process() {
+    if pgrep -x "antigravity" >/dev/null 2>&1; then
+        log_warn "Antigravity is currently running."
+        if [[ "$FORCE" == true || "$NON_INTERACTIVE" == true ]]; then
+            log_warn "Terminating running Antigravity processes..."
+            pkill -x "antigravity" 2>/dev/null || true
+            sleep 1
+        elif [[ -t 0 ]]; then
+            read -rp "Close Antigravity and continue? [y/N]: " choice
+            case "$choice" in
+                [yY][eE][sS]|[yY])
+                    log_info "Closing Antigravity..."
+                    pkill -x "antigravity" 2>/dev/null || true
+                    sleep 1
+                    ;;
+                *)
+                    log_error "Installation cancelled. Please close Antigravity before updating."
+                    exit 1
+                    ;;
+            esac
+        else
+            log_error "Antigravity is running. Close it or run with --force."
+            exit 1
+        fi
+    fi
+}
+
+# ==================== Version Detection ====================
+detect_current_version() {
+    local version=""
+    local check_dirs=("$INSTALL_DIR" "/opt/Antigravity")
+
+    for dir in "${check_dirs[@]}"; do
+        [[ ! -d "$dir" ]] && continue
+
+        # Method 1: Check .version marker written by updater
+        if [[ -f "$dir/.version" ]]; then
+            version=$(head -n1 "$dir/.version" | tr -d '[:space:]')
+        fi
+
+        # Method 2: Extract version from resources/app.asar using python3
+        if [[ -z "$version" && -f "$dir/resources/app.asar" ]] && command -v python3 >/dev/null 2>&1; then
+            version=$(python3 -c '
+import struct, json, sys
+try:
+    with open("'"$dir/resources/app.asar"'", "rb") as f:
+        f.seek(4)
+        hdr_size = struct.unpack("<I", f.read(4))[0]
+        f.seek(16)
+        hdr_raw = f.read(hdr_size - 8).decode("utf-8", errors="ignore")
+        last_brace = hdr_raw.rfind("}")
+        if last_brace != -1:
+            hdr_raw = hdr_raw[:last_brace + 1]
+        header = json.loads(hdr_raw)
+        files = header.get("files", {})
+        if "package.json" in files:
+            base_offset = 8 + hdr_size
+            node = files["package.json"]
+            f.seek(base_offset + int(node["offset"]))
+            pkg = json.loads(f.read(node["size"]).decode("utf-8", errors="ignore"))
+            print(pkg.get("version", ""))
+except Exception:
+    pass
+' 2>/dev/null || true)
+        fi
+
+        # Method 3: Check app.asar.unpacked/package.json
+        if [[ -z "$version" && -f "$dir/resources/app.asar.unpacked/package.json" ]]; then
+            version=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$dir/resources/app.asar.unpacked/package.json" 2>/dev/null | head -n1 || true)
+        fi
+
+        # Method 4: Fallback to npx asar
+        if [[ -z "$version" && -f "$dir/resources/app.asar" ]] && command -v npx >/dev/null 2>&1; then
+            local tmp_dir
+            tmp_dir=$(mktemp -d)
+            if (cd "$tmp_dir" && npx --yes asar extract-file "$dir/resources/app.asar" package.json >/dev/null 2>&1); then
+                version=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$tmp_dir/package.json" 2>/dev/null | head -n1 || true)
+            fi
+            rm -rf "$tmp_dir"
+        fi
+
+        [[ -n "$version" ]] && break
+    done
+
+    echo "${version:-unknown}"
+}
+
+# ==================== Manifest & Version Lookup ====================
+detect_manifest_base_url() {
+    # 1. Environment variable override
+    if [[ -n "${ANTIGRAVITY_MANIFEST_URL:-}" ]]; then
+        echo "${ANTIGRAVITY_MANIFEST_URL%/}"
+        return 0
+    fi
+
+    # 2. Dynamic discovery: read from installed app's resources/app-update.yml
+    local app_update_yml="$INSTALL_DIR/resources/app-update.yml"
+    if [[ -f "$app_update_yml" ]]; then
+        local found_url
+        found_url=$(grep -oP '^url:\s*\K\S+' "$app_update_yml" 2>/dev/null || true)
+        if [[ -n "$found_url" ]]; then
+            echo "${found_url%/}"
+            return 0
+        fi
+    fi
+
+    # 3. Default fallback URL
+    echo "$DEFAULT_MANIFEST_BASE"
+}
+
+fetch_manifest() {
+    local arch_tag
+    arch_tag=$(detect_manifest_arch)
+    local ts
+    ts=$(date +%s 2>/dev/null || echo "0")
+    local manifest_base
+    manifest_base=$(detect_manifest_base_url)
+    
+    local urls=(
+        "${manifest_base}/latest-${arch_tag}-linux.yml?noCache=${ts}"
+        "${manifest_base}/latest-${arch_tag}-linux.yml"
+        "${manifest_base}/latest-x64-linux.yml"
+        "${manifest_base}/latest-linux.yml"
+        "${DEFAULT_MANIFEST_BASE}/latest-${arch_tag}-linux.yml"
+    )
+
+    for url in "${urls[@]}"; do
+        local content
+        content=$(curl -sfL --max-time 8 "$url" 2>/dev/null || true)
+        if [[ -n "$content" && "$content" == *"version:"* ]]; then
+            echo "$content"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Parse version and execution_id from YAML manifest
+# Outputs: "<version> <execution_id>"
+parse_manifest() {
+    local raw="$1"
+    python3 -c '
+import sys, re
+text = sys.stdin.read()
+ver_m = re.search(r"version:\s*([0-9\.]+)", text)
+id_m = re.search(r"/antigravity-hub/[0-9\.]+-([0-9]+)/", text)
+ver = ver_m.group(1) if ver_m else ""
+exec_id = id_m.group(1) if id_m else ""
+if ver and exec_id:
+    print(f"{ver} {exec_id}")
+    sys.exit(0)
+sys.exit(1)
+' <<< "$raw" 2>/dev/null || true
+}
+
+# ==================== Icon Extraction ====================
+extract_app_icon() {
+    local asar_file="$INSTALL_DIR/resources/app.asar"
+    local target_icon="$ICON_DIR/antigravity.png"
+
+    mkdir -p "$ICON_DIR"
+
+    log_info "Extracting and updating application icons..."
+
+    # Method 1: Python extraction directly from asar archive
+    if [[ -f "$asar_file" ]] && command -v python3 >/dev/null 2>&1; then
+        if python3 -c '
+import struct, json, os, sys
+asar_path = sys.argv[1]
+out_path = sys.argv[2]
+system_icon_base = sys.argv[3]
+try:
+    with open(asar_path, "rb") as f:
+        f.seek(4)
+        hdr_size = struct.unpack("<I", f.read(4))[0]
+        f.seek(16)
+        hdr_raw = f.read(hdr_size - 8).decode("utf-8", errors="ignore")
+        last_brace = hdr_raw.rfind("}")
+        if last_brace != -1:
+            hdr_raw = hdr_raw[:last_brace + 1]
+        header = json.loads(hdr_raw)
+        base_offset = 8 + hdr_size
+        files = header.get("files", {})
+        
+        target = files.get("icon.png") or files.get("icons/icon.png")
+        if target and "offset" in target and "size" in target:
+            f.seek(base_offset + int(target["offset"]))
+            data = f.read(target["size"])
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            with open(out_path, "wb") as out:
+                out.write(data)
+            
+            # Install multi-resolution icons into hicolor icon theme
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(data))
+                for size in [16, 24, 32, 48, 64, 128, 256, 512, 1024]:
+                    dest_dir = os.path.join(system_icon_base, f"{size}x{size}", "apps")
+                    os.makedirs(dest_dir, exist_ok=True)
+                    dest_file = os.path.join(dest_dir, "antigravity.png")
+                    resized = img.resize((size, size), Image.Resampling.LANCZOS)
+                    resized.save(dest_file)
+            except Exception:
+                dest_dir = os.path.join(system_icon_base, "512x512", "apps")
+                os.makedirs(dest_dir, exist_ok=True)
+                with open(os.path.join(dest_dir, "antigravity.png"), "wb") as out:
+                    out.write(data)
+            sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+' "$asar_file" "$target_icon" "$SYSTEM_ICON_DIR" 2>/dev/null; then
+            if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+                gtk-update-icon-cache -f -t "$SYSTEM_ICON_DIR" 2>/dev/null || true
+            fi
+            log_ok "Application icons extracted and registered to icon theme."
+            return 0
+        fi
+    fi
+
+    # Method 2: Fallback to npx asar
+    if [[ -f "$asar_file" ]] && command -v npx >/dev/null 2>&1; then
+        local tmp_icon_dir
+        tmp_icon_dir=$(mktemp -d)
+        if (cd "$tmp_icon_dir" && npx --yes asar extract-file "$asar_file" icon.png >/dev/null 2>&1); then
+            mv "$tmp_icon_dir/icon.png" "$target_icon"
+            mkdir -p "$SYSTEM_ICON_DIR/512x512/apps"
+            cp -f "$target_icon" "$SYSTEM_ICON_DIR/512x512/apps/antigravity.png" 2>/dev/null || true
+            if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+                gtk-update-icon-cache -f -t "$SYSTEM_ICON_DIR" 2>/dev/null || true
+            fi
+            log_ok "Application icon extracted via npx."
+            rm -rf "$tmp_icon_dir"
+            return 0
+        fi
+        rm -rf "$tmp_icon_dir"
+    fi
+
+    log_warn "Application icon could not be extracted automatically."
+}
+
+# ==================== CLI & Desktop Setup ====================
+setup_cli_and_desktop() {
+    # 1. Desktop Entry
+    mkdir -p "$DESKTOP_DIR"
+    local desktop_file="$DESKTOP_DIR/antigravity.desktop"
+
+    cat > "$desktop_file" <<EOF
+[Desktop Entry]
+Name=Antigravity
+GenericName=Agentic Desktop
+Comment=Google Antigravity 2.0 Agentic Desktop
+Exec=$INSTALL_DIR/antigravity --no-sandbox %U
+Icon=antigravity
+Type=Application
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=Antigravity
+MimeType=x-scheme-handler/antigravity;text/html;
+EOF
+    chmod +x "$desktop_file"
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    fi
+
+    # Sync to ~/Desktop screen shortcut if Desktop folder exists
+    if [[ -d "$HOME/Desktop" ]]; then
+        cp -f "$desktop_file" "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
+        chmod +x "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
+        if command -v gio >/dev/null 2>&1; then
+            gio set "$HOME/Desktop/antigravity.desktop" metadata::trusted true 2>/dev/null || true
+        fi
+    fi
+
+    # 2. CLI Wrapper in ~/.local/bin/antigravity
+    if mkdir -p "$BIN_DIR" 2>/dev/null; then
+        local bin_file="$BIN_DIR/antigravity"
+        if cat > "$bin_file" 2>/dev/null <<EOF
+#!/usr/bin/env bash
+exec "$INSTALL_DIR/antigravity" --no-sandbox "\$@"
+EOF
+        then
+            chmod +x "$bin_file" 2>/dev/null || true
+        fi
+    fi
+}
+
+# ==================== Backup Management ====================
+prune_old_backups() {
+    if [[ "$KEEP_BACKUP" == false && -d "$BACKUP_DIR" ]]; then
+        local backups=()
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && backups+=("$f")
+        done < <(find "$BACKUP_DIR" -maxdepth 1 -name "antigravity-*.tar.gz" -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
+
+        if [[ ${#backups[@]} -gt 3 ]]; then
+            log_info "Pruning older backups (keeping latest 3)..."
+            for ((i=3; i<${#backups[@]}; i++)); do
+                rm -f "${backups[$i]}"
+            done
+        fi
+    fi
+}
+
+# ==================== Rollback Feature ====================
+do_rollback() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_error "No backups found in $BACKUP_DIR"
+        exit 1
+    fi
+
+    local latest_backup
+    latest_backup=$(find "$BACKUP_DIR" -maxdepth 1 -name "antigravity-*.tar.gz" -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | awk '{print $2}')
+
+    if [[ -z "$latest_backup" || ! -f "$latest_backup" ]]; then
+        log_error "No backup archive found in $BACKUP_DIR"
+        exit 1
+    fi
+
+    log_info "Latest backup found: $(basename "$latest_backup")"
+
+    if [[ "$FORCE" == false && "$NON_INTERACTIVE" == false && -t 0 ]]; then
+        read -rp "Restore this backup? Current installation will be replaced. [y/N]: " choice
+        case "$choice" in
+            [yY][eE][sS]|[yY]) ;;
+            *) log_info "Rollback cancelled."; exit 0 ;;
+        esac
+    fi
+
+    check_running_process
+
+    log_info "Restoring backup archive..."
+    rm -rf "$INSTALL_DIR"
+    mkdir -p "$(dirname "$INSTALL_DIR")"
+    tar -xzf "$latest_backup" -C "$(dirname "$INSTALL_DIR")"
+
+    setup_cli_and_desktop
+    log_ok "Rollback complete! Successfully restored from $(basename "$latest_backup")"
+    exit 0
+}
+
+# ==================== Argument Parsing ====================
+CHECK_ONLY=false
+FORCE=false
+KEEP_BACKUP=false
+NON_INTERACTIVE=false
+ROLLBACK=false
+TARGET_VERSION=""
+CUSTOM_HASH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--check)       CHECK_ONLY=true; shift ;;
+        -f|--force)       FORCE=true; shift ;;
+        -k|--keep)        KEEP_BACKUP=true; shift ;;
+        -y|--yes)         NON_INTERACTIVE=true; shift ;;
+        -v|--version)     TARGET_VERSION="$2"; shift 2 ;;
+        --hash)           CUSTOM_HASH="$2"; shift 2 ;;
+        --rollback)       ROLLBACK=true; shift ;;
+        -h|--help)        usage ;;
+        *) log_error "Unknown option: $1"; usage ;;
+    esac
+done
+
+if [[ "$ROLLBACK" == true ]]; then
+    do_rollback
+fi
+
+# ==================== Rollback / Cleanup Trap ====================
+BACKUP_PATH=""
+EXTRACT_DIR=""
+INSTALL_SUCCESS=false
+
+cleanup_handler() {
+    local exit_code=$?
+    if [[ -n "$EXTRACT_DIR" && -d "$EXTRACT_DIR" ]]; then
+        rm -rf "$EXTRACT_DIR"
+    fi
+    if [[ $exit_code -ne 0 && "$INSTALL_SUCCESS" == false ]]; then
+        if [[ -n "$BACKUP_PATH" && -f "$BACKUP_PATH" && ! -f "$INSTALL_DIR/antigravity" ]]; then
+            log_warn "Installation was interrupted or failed. Rolling back..."
+            rm -rf "$INSTALL_DIR"
+            mkdir -p "$(dirname "$INSTALL_DIR")"
+            tar -xzf "$BACKUP_PATH" -C "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+            log_warn "Rollback to previous state complete."
+        fi
+    fi
+}
+trap cleanup_handler EXIT INT TERM
+
+# ==================== Main Workflow ====================
+CURRENT_VERSION=$(detect_current_version)
+PLATFORM=$(detect_arch)
+log_info "System platform: $PLATFORM"
+log_info "Current installed version: $CURRENT_VERSION"
+
+log_info "Checking auto-updater manifest..."
+
+MANIFEST_RAW=""
+MANIFEST_VER=""
+MANIFEST_ID=""
+
+if MANIFEST_RAW=$(fetch_manifest); then
+    if PARSED=$(parse_manifest "$MANIFEST_RAW"); then
+        MANIFEST_VER=$(echo "$PARSED" | awk '{print $1}')
+        MANIFEST_ID=$(echo "$PARSED" | awk '{print $2}')
+        log_info "Online manifest reports version: $MANIFEST_VER (build: $MANIFEST_ID)"
+    fi
+fi
+
+# Determine Target Version and Execution ID
+RESOLVED_VER=""
+RESOLVED_ID=""
+
+if [[ -n "$TARGET_VERSION" ]]; then
+    RESOLVED_VER="$TARGET_VERSION"
+    if [[ -n "$CUSTOM_HASH" ]]; then
+        RESOLVED_ID="$CUSTOM_HASH"
+    elif [[ -n "${KNOWN_RELEASES[$TARGET_VERSION]:-}" ]]; then
+        RESOLVED_ID="${KNOWN_RELEASES[$TARGET_VERSION]}"
+    elif [[ "$TARGET_VERSION" == "$MANIFEST_VER" && -n "$MANIFEST_ID" ]]; then
+        RESOLVED_ID="$MANIFEST_ID"
+    else
+        log_warn "Unknown build ID for requested version $TARGET_VERSION. Using default."
+        RESOLVED_ID="$LATEST_KNOWN_HASH"
+    fi
+else
+    # Auto-detect latest available version
+    if [[ -n "$MANIFEST_VER" && -n "$MANIFEST_ID" ]]; then
+        # Compare manifest version against latest known release
+        cmp_res=0
+        compare_versions "$MANIFEST_VER" "$LATEST_KNOWN_VERSION" || cmp_res=$?
+        if [[ $cmp_res -eq 2 ]]; then
+            # Latest known version (e.g. 2.19.1) is newer than manifest version (e.g. 2.18.1)
+            RESOLVED_VER="$LATEST_KNOWN_VERSION"
+            RESOLVED_ID="$LATEST_KNOWN_HASH"
+        else
+            RESOLVED_VER="$MANIFEST_VER"
+            RESOLVED_ID="$MANIFEST_ID"
+        fi
+    else
+        log_info "Manifest offline. Using latest known release ($LATEST_KNOWN_VERSION)."
+        RESOLVED_VER="$LATEST_KNOWN_VERSION"
+        RESOLVED_ID="$LATEST_KNOWN_HASH"
+    fi
+fi
+
+INSTALL_VERSION="$RESOLVED_VER"
+EXECUTION_ID="$RESOLVED_ID"
+
+log_info "Target version:  $INSTALL_VERSION (build: $EXECUTION_ID)"
+
+# Version comparison check
+cmp_current=-1
+if [[ "$CURRENT_VERSION" != "unknown" ]]; then
+    compare_versions "$CURRENT_VERSION" "$INSTALL_VERSION" && cmp_current=0 || cmp_current=$?
+fi
+
+if [[ "$cmp_current" -eq 0 && "$FORCE" == false ]]; then
+    log_ok "Antigravity is already up to date (version: $CURRENT_VERSION)."
+    if [[ "$CHECK_ONLY" == true ]]; then
+        exit 0
+    fi
+    log_info "Run with --force to reinstall."
+    exit 0
+elif [[ "$cmp_current" -eq 1 && "$FORCE" == false && -z "$TARGET_VERSION" ]]; then
+    log_ok "Current version ($CURRENT_VERSION) is already newer than release channel ($INSTALL_VERSION)."
+    if [[ "$CHECK_ONLY" == true ]]; then
+        exit 0
+    fi
+    log_info "Run with --force to reinstall."
+    exit 0
+fi
+
+if [[ "$CHECK_ONLY" == true ]]; then
+    if [[ "$CURRENT_VERSION" == "unknown" ]]; then
+        log_info "Antigravity is not currently installed. Latest available: $INSTALL_VERSION"
+    elif [[ "$cmp_current" -eq 2 ]]; then
+        log_warn "New version available: $CURRENT_VERSION -> $INSTALL_VERSION"
+        log_info "Run '$0' to install."
+    elif [[ "$CURRENT_VERSION" != "$INSTALL_VERSION" ]]; then
+        log_info "Target version differs: $CURRENT_VERSION -> $INSTALL_VERSION"
+    fi
+    exit 0
+fi
+
+# Check for running application before downloading/installing
+check_running_process
+
+# ==================== Download ====================
+TARBALL_URL="${BASE_URL}/${INSTALL_VERSION}-${EXECUTION_ID}/${PLATFORM}/Antigravity.tar.gz"
+TARBALL_PATH="$CACHE_DIR/Antigravity-${INSTALL_VERSION}-${EXECUTION_ID}-${PLATFORM}.tar.gz"
+
+mkdir -p "$CACHE_DIR"
+
+if [[ -f "$TARBALL_PATH" ]]; then
+    log_info "Using cached download: $TARBALL_PATH"
+else
+    log_info "Downloading: $TARBALL_URL"
+    if ! curl -fL --progress-bar -o "$TARBALL_PATH" "$TARBALL_URL"; then
+        log_error "Download failed. The release archive could not be fetched."
+        log_error "URL attempted: $TARBALL_URL"
+        exit 1
+    fi
+    file_size=$(du -h "$TARBALL_PATH" | cut -f1)
+    log_ok "Download complete: $file_size"
+fi
+
+# ==================== Extract ====================
+EXTRACT_DIR=$(mktemp -d)
+log_info "Extracting archive..."
+
+if ! tar -xzf "$TARBALL_PATH" -C "$EXTRACT_DIR"; then
+    log_error "Extraction failed."
+    exit 1
+fi
+
+EXTRACTED_APP=$(find "$EXTRACT_DIR" -maxdepth 2 -type f -name "antigravity" -exec dirname {} \; 2>/dev/null | head -n1 || true)
+if [[ -z "$EXTRACTED_APP" || ! -d "$EXTRACTED_APP" ]]; then
+    log_error "Antigravity application files not found in extracted archive."
+    exit 1
+fi
+
+log_ok "Extraction successful."
+
+# ==================== Backup ====================
+if [[ -d "$INSTALL_DIR" ]]; then
+    mkdir -p "$BACKUP_DIR"
+    BACKUP_PATH="$BACKUP_DIR/antigravity-${CURRENT_VERSION}-$(date +%Y%m%d-%H%M%S).tar.gz"
+    log_info "Creating backup of current installation..."
+    tar -czf "$BACKUP_PATH" -C "$(dirname "$INSTALL_DIR")" "$(basename "$INSTALL_DIR")" 2>/dev/null || true
+    log_ok "Backup created: $BACKUP_PATH"
+fi
+
+# ==================== Install ====================
+log_info "Installing Antigravity $INSTALL_VERSION..."
+
+# Preserve existing custom icons if present
+TMP_ICON=""
+if [[ -d "$ICON_DIR" ]]; then
+    TMP_ICON=$(mktemp -d)
+    cp -a "$ICON_DIR"/. "$TMP_ICON"/ 2>/dev/null || true
+fi
+
+rm -rf "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+cp -a "$EXTRACTED_APP"/. "$INSTALL_DIR"/
+
+# Restore preserved icons if needed
+if [[ -n "$TMP_ICON" && -d "$TMP_ICON" ]]; then
+    mkdir -p "$ICON_DIR"
+    cp -a "$TMP_ICON"/. "$ICON_DIR"/ 2>/dev/null || true
+    rm -rf "$TMP_ICON"
+fi
+
+# Mark executable permissions
+chmod +x "$INSTALL_DIR/antigravity" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/chrome-sandbox" 2>/dev/null || true
+
+# Write version file
+echo "$INSTALL_VERSION" > "$INSTALL_DIR/.version"
+
+# Extract icon if missing
+extract_app_icon
+
+# Configure Desktop entry and CLI symlink/wrapper
+setup_cli_and_desktop
+
+# Prune old backups
+prune_old_backups
+
+# ==================== Verification ====================
+if [[ -x "$INSTALL_DIR/antigravity" ]]; then
+    INSTALL_SUCCESS=true
+    log_ok "=========================================="
+    log_ok "  Antigravity $INSTALL_VERSION successfully installed!"
+    log_ok "=========================================="
+    log_info "Installation:  $INSTALL_DIR"
+    log_info "CLI Command:   $BIN_DIR/antigravity"
+    log_info "Desktop Entry: $DESKTOP_DIR/antigravity.desktop"
+    log_info "App Icon:      $SYSTEM_ICON_DIR/.../antigravity.png"
+    echo ""
+    log_info "You can launch Antigravity from your Application Menu or by running:"
+    log_info "  antigravity"
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+        echo ""
+        log_warn "Note: '$BIN_DIR' is not in your current PATH."
+        log_warn "Add it to ~/.bashrc: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
+else
+    log_error "Installation verification failed. Executable not found."
+    exit 1
+fi

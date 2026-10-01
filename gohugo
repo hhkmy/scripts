@@ -1,0 +1,282 @@
+#!/bin/bash
+
+# 🎨 Color and emoji variables
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+CHECK="✅"
+INFO="ℹ️"
+WARN="⚠️"
+ROCKET="🚀"
+DOWNLOAD="📥"
+GEAR="⚙️"
+HOURGLASS="⏳"
+PARTY="🎉"
+MAG="🔍"
+
+# 📌 Configuration
+readonly HUGO_EXTENDED="hugo_extended"
+readonly HUGO_EXTENDED_WITHDEPLOY="hugo_extended_withdeploy"
+readonly DOWNLOAD_URL_REGEX='"browser_download_url":\s*"\K[^"]*'
+HUGO_REPO="gohugoio/hugo"
+HUGO_TYPE="$HUGO_EXTENDED" # Default: hugo_extended
+INSTALL_DIR="/usr/local/bin"
+TMP_DIR=$(mktemp -d)
+
+# 🔧 Parse command line arguments
+INTERACTIVE_MODE=true
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --force|-f)
+            FORCE_INSTALL=true
+            shift
+            ;;
+        --normal|-n)
+            HUGO_TYPE="hugo"
+            INTERACTIVE_MODE=false
+            shift
+            ;;
+        --extended|-e)
+            HUGO_TYPE="$HUGO_EXTENDED"
+            INTERACTIVE_MODE=false
+            shift
+            ;;
+        --withdeploy|-w)
+            HUGO_TYPE="$HUGO_EXTENDED_WITHDEPLOY"
+            INTERACTIVE_MODE=false
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo "Options:"
+            echo "  --normal, -n       Install Hugo Normal (basic version)"
+            echo "  --extended, -e     Install Hugo Extended (default)"
+            echo "  --withdeploy, -w   Install Hugo Extended with Deploy features"
+            echo "  --force, -f        Force reinstall even if latest version is installed"
+            echo "  --help, -h         Show this help message"
+            echo ""
+            echo "If no version option is specified, you'll be prompted to choose interactively."
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# 🎯 Interactive Hugo version selection
+if [[ "$INTERACTIVE_MODE" = true ]]; then
+    echo -e "${MAG} ${BLUE}Choose Hugo version to install:${NC}"
+    echo -e "  ${GREEN}1)${NC} Hugo Normal (basic version)"
+    echo -e "  ${GREEN}2)${NC} Hugo Extended (recommended - includes Sass/SCSS support) ${YELLOW}[DEFAULT]${NC}"
+    echo -e "  ${GREEN}3)${NC} Hugo Extended with Deploy (includes cloud deployment features)"
+    echo ""
+    echo -n "Enter your choice (1-3) [2]: "
+    read -r CHOICE
+    case $CHOICE in
+        1)
+            HUGO_TYPE="hugo"
+            ;;
+        3)
+            HUGO_TYPE="$HUGO_EXTENDED_WITHDEPLOY"
+            ;;
+        2|"")
+            HUGO_TYPE="$HUGO_EXTENDED"
+            ;;
+        *)
+            echo -e "${WARN} ${YELLOW}Invalid choice. Using default: Hugo Extended${NC}"
+            HUGO_TYPE="$HUGO_EXTENDED"
+            ;;
+    esac
+    echo ""
+fi
+
+# 🔍 Detect OS and architecture
+echo -e "${INFO} ${RED} Detecting${NC} your system..."
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+# Normalize architecture names
+case $ARCH in
+    x86_64)
+        ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        ARCH="arm64"
+        ;;
+    i386|i686)
+        ARCH="386"
+        ;;
+    *)
+        echo -e "${WARN} ${YELLOW}Unsupported architecture: $ARCH${NC}"
+        exit 1
+        ;;
+esac
+
+# Normalize OS names
+case $OS in
+    linux)
+        OS="Linux"
+        ;;
+    darwin)
+        OS="macOS"
+        ;;
+    *)
+        echo -e "${WARN} ${YELLOW}Unsupported OS: $OS${NC}"
+        exit 1
+        ;;
+esac
+
+echo -e "${CHECK} ${GREEN}Detected: $OS $ARCH${NC}"
+
+# 🕵️ Check existing Hugo installation
+CURRENT_VERSION=""
+if command -v hugo &> /dev/null; then
+    CURRENT_VERSION=$(hugo version | grep -oP 'v\d+\.\d+\.\d+')
+    echo -e "${INFO} ${BLUE} Found existing Hugo installation:${NC} ${CURRENT_VERSION}"
+else
+    echo -e "${INFO} ${BLUE}No existing Hugo installation found.${NC}"
+fi
+
+# 📡 Fetch latest release info from GitHub API
+HUGO_VARIANT_NAME=$(echo "$HUGO_TYPE" | sed 's/_/ /g' | sed 's/\b\w/\u&/g')
+echo -e "${HOURGLASS} ${BLUE}Checking for latest ${HUGO_VARIANT_NAME} release...${NC}"
+
+LATEST_RELEASE=$(curl -s --proto-default https --proto-redir =https "https://api.github.com/repos/$HUGO_REPO/releases/latest")
+LATEST_VERSION=$(echo "$LATEST_RELEASE" | grep -oP '"tag_name": "\Kv\d+\.\d+\.\d+')
+
+if [[ -z "$LATEST_VERSION" ]]; then
+    echo -e "${WARN} ${RED}Failed to fetch latest version!${NC}"
+    exit 1
+fi
+
+echo -e "${CHECK} ${GREEN}Latest ${HUGO_VARIANT_NAME} version:${NC} ${LATEST_VERSION}"
+
+# 🔄 Check if update is needed
+FORCE_INSTALL=${FORCE_INSTALL:-false}
+
+# Check if current installation is extended version
+CURRENT_IS_EXTENDED=false
+CURRENT_HAS_DEPLOY=false
+CURRENT_IS_NORMAL=false
+if command -v hugo &> /dev/null; then
+    CURRENT_FULL_VERSION=$(hugo version)
+    if echo "$CURRENT_FULL_VERSION" | grep -q "extended"; then
+        CURRENT_IS_EXTENDED=true
+        if echo "$CURRENT_FULL_VERSION" | grep -q "withdeploy\|deploy"; then
+            CURRENT_HAS_DEPLOY=true
+        fi
+    else
+        CURRENT_IS_NORMAL=true
+    fi
+fi
+
+# Determine if current installation matches desired type
+CURRENT_MATCHES_DESIRED=false
+if [[ "$HUGO_TYPE" == "$HUGO_EXTENDED_WITHDEPLOY" ]]; then
+    if [[ "$CURRENT_IS_EXTENDED" == true && "$CURRENT_HAS_DEPLOY" == true ]]; then
+        CURRENT_MATCHES_DESIRED=true
+    fi
+elif [[ "$HUGO_TYPE" == "$HUGO_EXTENDED" ]]; then
+    if [[ "$CURRENT_IS_EXTENDED" == true && "$CURRENT_HAS_DEPLOY" == false ]]; then
+        CURRENT_MATCHES_DESIRED=true
+    fi
+elif [[ "$HUGO_TYPE" == "hugo" ]]; then
+    if [[ "$CURRENT_IS_NORMAL" == true ]]; then
+        CURRENT_MATCHES_DESIRED=true
+    fi
+fi
+
+if [[ "$CURRENT_VERSION" == "$LATEST_VERSION" && "$CURRENT_MATCHES_DESIRED" == true && "$FORCE_INSTALL" == false ]]; then
+    echo -e "${PARTY} ${GREEN}You already have the latest ${HUGO_VARIANT_NAME} version!${NC} (${CURRENT_VERSION})"
+    exit 0
+elif [[ "$CURRENT_VERSION" == "$LATEST_VERSION" && "$CURRENT_MATCHES_DESIRED" == false ]]; then
+    echo -e "${INFO} ${YELLOW}You have the latest version but different variant. Installing ${HUGO_VARIANT_NAME}...${NC}"
+elif [[ -n "$CURRENT_VERSION" ]]; then
+    if [[ "$CURRENT_MATCHES_DESIRED" == true ]]; then
+        echo -e "${INFO} ${YELLOW}Updating ${HUGO_VARIANT_NAME} from ${CURRENT_VERSION} to ${LATEST_VERSION}${NC}"
+    else
+        echo -e "${INFO} ${YELLOW}Switching from current Hugo ${CURRENT_VERSION} to ${HUGO_VARIANT_NAME} ${LATEST_VERSION}${NC}"
+    fi
+fi
+
+# 📥 Download the appropriate binary
+ASSET_NAME="${HUGO_TYPE}_${LATEST_VERSION#v}_${OS,,}-${ARCH}.tar.gz"
+DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "$ASSET_NAME")
+
+# If not found, try alternative naming patterns
+if [[ -z "$DOWNLOAD_URL" ]]; then
+    # Try with different case for OS
+    ASSET_NAME="${HUGO_TYPE}_${LATEST_VERSION#v}_${OS}-${ARCH}.tar.gz"
+    DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "$ASSET_NAME")
+fi
+
+if [[ -z "$DOWNLOAD_URL" && "$OS" == "Linux" && "$ARCH" == "amd64" ]]; then
+    # Try legacy naming for Linux 64bit
+    ASSET_NAME="${HUGO_TYPE}_${LATEST_VERSION#v}_Linux-64bit.tar.gz"
+    DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "$ASSET_NAME")
+fi
+
+# Special handling for normal Hugo (no prefix)
+if [[ -z "$DOWNLOAD_URL" && "$HUGO_TYPE" == "hugo" ]]; then
+    ASSET_NAME="hugo_${LATEST_VERSION#v}_${OS,,}-${ARCH}.tar.gz"
+    DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "$ASSET_NAME")
+    
+    if [[ -z "$DOWNLOAD_URL" ]]; then
+        ASSET_NAME="hugo_${LATEST_VERSION#v}_${OS}-${ARCH}.tar.gz"
+        DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "$ASSET_NAME")
+    fi
+    
+    if [[ -z "$DOWNLOAD_URL" && "$OS" == "Linux" && "$ARCH" == "amd64" ]]; then
+        ASSET_NAME="hugo_${LATEST_VERSION#v}_Linux-64bit.tar.gz"
+        DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "$ASSET_NAME")
+    fi
+fi
+
+if [[ -z "$DOWNLOAD_URL" ]]; then
+    echo -e "${WARN} ${RED}Could not find download URL for your system!${NC}"
+    echo -e "${INFO} ${YELLOW}Tried to find: ${ASSET_NAME}${NC}"
+    echo -e "${INFO} ${BLUE}Available assets:${NC}"
+    echo "$LATEST_RELEASE" | grep -oP "$DOWNLOAD_URL_REGEX" | grep "\.tar\.gz" | head -10
+    exit 1
+fi
+
+echo -e "${DOWNLOAD} ${BLUE}Downloading ${HUGO_VARIANT_NAME} ${LATEST_VERSION}...${NC}"
+curl -sL --proto-redir =https "$DOWNLOAD_URL" -o "$TMP_DIR/hugo.tar.gz" || {
+    echo -e "${WARN} ${RED}Download failed!${NC}"
+    exit 1
+}
+
+# 📦 Extract and install
+echo -e "${GEAR} ${BLUE}Installing Hugo...${NC}"
+tar -xzf "$TMP_DIR/hugo.tar.gz" -C "$TMP_DIR"
+
+# Check if we need sudo for installation
+if [[ -w "$INSTALL_DIR" ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+    echo -e "${INFO} ${YELLOW}Requires sudo to install to $INSTALL_DIR${NC}"
+fi
+
+$SUDO mv "$TMP_DIR/hugo" "$INSTALL_DIR/hugo"
+$SUDO chmod +x "$INSTALL_DIR/hugo"
+
+# 🧹 Clean up
+rm -rf "$TMP_DIR"
+
+# ✅ Verify installation
+if command -v hugo &> /dev/null; then
+    INSTALLED_VERSION=$(hugo version)
+    echo -e "${PARTY} ${GREEN}Successfully installed ${HUGO_VARIANT_NAME}!${NC}"
+    echo -e "${CHECK} ${BLUE}${INSTALLED_VERSION}${NC}"
+    echo -e "${ROCKET} ${GREEN}Happy static site building!${NC}"
+else
+    echo -e "${WARN} ${RED}Installation seems to have failed. Hugo command not found.${NC}"
+    exit 1
+fi
