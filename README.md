@@ -60,8 +60,11 @@ curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/antigravity | ba
 # Check for updates only
 ./antigravity --check
 
-# Install or update to latest version
+# Install or update to latest version (User-space: ~/.local/share/antigravity)
 ./antigravity
+
+# Install or update system-wide (Standard: /opt/Antigravity, requires sudo)
+sudo ./antigravity --global
 
 # Force reinstall current version
 ./antigravity --force
@@ -74,12 +77,14 @@ curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/antigravity | ba
 ```
 
 **Features:**
+- **Dual-Mode Installation (FHS Standard /opt or User-space):** Supports system-wide standard installation (`/opt/Antigravity`) via `--global` or isolated non-root user installation (`~/.local/share/antigravity`).
+- **External Tool & Manager Compatibility:** Automatically synchronizes `resources/app/package.json` loose metadata so tools like [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) and CLI switchers detect the version instantly without hanging.
 - **Zero-Dependency Icon & Version Extraction:** Directly parses `resources/app.asar` using standard library Python 3 to extract version info and high-res app icon without needing `npx` or `node`.
-- **System Icon Theme Integration:** Auto-generates multi-resolution icons (16x16 up to 1024x1024) into `~/.local/share/icons/hicolor/` for crisp display across GNOME/KDE docks, taskbars, and Alt+Tab switchers.
+- **System Icon Theme Integration:** Auto-generates multi-resolution icons (16x16 up to 1024x1024) into `~/.local/share/icons/hicolor/` (or `/usr/share/icons/hicolor/`) for crisp display across GNOME/KDE docks, taskbars, and Alt+Tab switchers.
 - **Dynamic Manifest Discovery:** Automatically queries active updater URL from local `app-update.yml` and official Google Cloud Run endpoints.
-- **Process Safety:** Detects running Antigravity instances to prevent filesystem corruption.
-- **Automated Backup & Rollback:** Archives existing installs to `~/.local/share/antigravity-backups/` and rolls back on failure.
-- **Desktop & CLI Integration:** Generates `.desktop` launcher with proper `StartupWMClass` and adds `~/.local/bin/antigravity` wrapper.
+- **Process & Socket Safety:** Gracefully terminates running Antigravity processes (SIGTERM with clean timeout fallback) to prevent filesystem corruption and lockfile lingering.
+- **Automated Backup & Rollback:** Archives existing installs to `antigravity-backups/` and rolls back on failure.
+- **Desktop & CLI Integration:** Generates `.desktop` launcher with proper `StartupWMClass`, hardens `chrome-sandbox` (SUID in global mode), and registers CLI symlinks/wrappers.
 
 ---
 

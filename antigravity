@@ -6,15 +6,8 @@
 
 set -euo pipefail
 
-# ==================== Configuration ====================
+# ==================== Default Configuration ====================
 APP_NAME="Antigravity"
-INSTALL_DIR="${ANTIGRAVITY_INSTALL_DIR:-$HOME/.local/share/antigravity}"
-ICON_DIR="$INSTALL_DIR/icons"
-SYSTEM_ICON_DIR="$HOME/.local/share/icons/hicolor"
-DESKTOP_DIR="$HOME/.local/share/applications"
-BIN_DIR="$HOME/.local/bin"
-BACKUP_DIR="$HOME/.local/share/antigravity-backups"
-CACHE_DIR="$HOME/.cache/antigravity-updater"
 
 BASE_URL="https://storage.googleapis.com/antigravity-public/antigravity-hub"
 DEFAULT_MANIFEST_BASE="https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest"
@@ -49,6 +42,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   -c, --check          Check for new version only (do not install)
+  -g, --global         Install system-wide to /opt/Antigravity (requires sudo/root)
   -f, --force          Reinstall even if version is identical / kill running instance
   -v, --version V      Install a specific version (e.g. 2.19.1)
       --hash H         Override release execution ID / build hash
@@ -58,7 +52,8 @@ Options:
   -h, --help           Show this help message
 
 Examples:
-  $0                   # Check and install latest version
+  $0                   # Install or update for current user (~/.local/share/antigravity)
+  sudo $0 --global     # Install system-wide to standard /opt/Antigravity (FHS compliant)
   $0 --check           # Check for new version only
   $0 --version 2.19.1  # Install specific version
   $0 --force           # Force reinstall current version
@@ -105,21 +100,43 @@ else: sys.exit(2)
 " 2>/dev/null
 }
 
-# ==================== Running Process Check ====================
+# ==================== Running Process & Termination Handling ====================
+terminate_antigravity_processes() {
+    local max_wait=5
+    log_info "Stopping running Antigravity processes cleanly..."
+
+    # 1. Graceful SIGTERM to allow electron state saving and socket cleanup
+    pkill -TERM -f "$INSTALL_DIR/antigravity" 2>/dev/null || true
+    pkill -TERM -x "antigravity" 2>/dev/null || true
+    pkill -TERM -f "language_server.*antigravity" 2>/dev/null || true
+
+    # 2. Wait up to max_wait seconds
+    local count=0
+    while pgrep -f "$INSTALL_DIR/antigravity" >/dev/null 2>&1 || pgrep -x "antigravity" >/dev/null 2>&1; do
+        sleep 0.5
+        count=$((count + 1))
+        if [[ $count -ge $((max_wait * 2)) ]]; then
+            log_warn "Processes still running after ${max_wait}s. Force killing with SIGKILL..."
+            pkill -KILL -f "$INSTALL_DIR/antigravity" 2>/dev/null || true
+            pkill -KILL -x "antigravity" 2>/dev/null || true
+            pkill -KILL -f "language_server.*antigravity" 2>/dev/null || true
+            sleep 0.5
+            break
+        fi
+    done
+    log_ok "All Antigravity processes stopped."
+}
+
 check_running_process() {
-    if pgrep -x "antigravity" >/dev/null 2>&1; then
+    if pgrep -f "$INSTALL_DIR/antigravity" >/dev/null 2>&1 || pgrep -x "antigravity" >/dev/null 2>&1; then
         log_warn "Antigravity is currently running."
         if [[ "$FORCE" == true || "$NON_INTERACTIVE" == true ]]; then
-            log_warn "Terminating running Antigravity processes..."
-            pkill -x "antigravity" 2>/dev/null || true
-            sleep 1
+            terminate_antigravity_processes
         elif [[ -t 0 ]]; then
             read -rp "Close Antigravity and continue? [y/N]: " choice
             case "$choice" in
                 [yY][eE][sS]|[yY])
-                    log_info "Closing Antigravity..."
-                    pkill -x "antigravity" 2>/dev/null || true
-                    sleep 1
+                    terminate_antigravity_processes
                     ;;
                 *)
                     log_error "Installation cancelled. Please close Antigravity before updating."
@@ -134,21 +151,24 @@ check_running_process() {
 }
 
 # ==================== Version Detection ====================
-detect_current_version() {
-    local version=""
-    local check_dirs=("$INSTALL_DIR" "/opt/Antigravity")
+detect_version_in_dir() {
+    local dir="$1"
+    [[ ! -d "$dir" ]] && echo "" && return 0
+    local ver=""
 
-    for dir in "${check_dirs[@]}"; do
-        [[ ! -d "$dir" ]] && continue
+    # Method 1: Check .version marker written by updater
+    if [[ -f "$dir/.version" ]]; then
+        ver=$(head -n1 "$dir/.version" | tr -d '[:space:]')
+    fi
 
-        # Method 1: Check .version marker written by updater
-        if [[ -f "$dir/.version" ]]; then
-            version=$(head -n1 "$dir/.version" | tr -d '[:space:]')
-        fi
+    # Method 2: Check resources/app/package.json (loose metadata)
+    if [[ -z "$ver" && -f "$dir/resources/app/package.json" ]]; then
+        ver=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$dir/resources/app/package.json" 2>/dev/null | head -n1 || true)
+    fi
 
-        # Method 2: Extract version from resources/app.asar using python3
-        if [[ -z "$version" && -f "$dir/resources/app.asar" ]] && command -v python3 >/dev/null 2>&1; then
-            version=$(python3 -c '
+    # Method 3: Extract version from resources/app.asar using python3
+    if [[ -z "$ver" && -f "$dir/resources/app.asar" ]] && command -v python3 >/dev/null 2>&1; then
+        ver=$(python3 -c '
 import struct, json, sys
 try:
     with open("'"$dir/resources/app.asar"'", "rb") as f:
@@ -170,27 +190,54 @@ try:
 except Exception:
     pass
 ' 2>/dev/null || true)
+    fi
+
+    # Method 4: Check app.asar.unpacked/package.json
+    if [[ -z "$ver" && -f "$dir/resources/app.asar.unpacked/package.json" ]]; then
+        ver=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$dir/resources/app.asar.unpacked/package.json" 2>/dev/null | head -n1 || true)
+    fi
+
+    # Method 5: Fallback to npx asar
+    if [[ -z "$ver" && -f "$dir/resources/app.asar" ]] && command -v npx >/dev/null 2>&1; then
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        if (cd "$tmp_dir" && npx --yes asar extract-file "$dir/resources/app.asar" package.json >/dev/null 2>&1); then
+            ver=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$tmp_dir/package.json" 2>/dev/null | head -n1 || true)
         fi
+        rm -rf "$tmp_dir"
+    fi
 
-        # Method 3: Check app.asar.unpacked/package.json
-        if [[ -z "$version" && -f "$dir/resources/app.asar.unpacked/package.json" ]]; then
-            version=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$dir/resources/app.asar.unpacked/package.json" 2>/dev/null | head -n1 || true)
-        fi
+    echo "$ver"
+}
 
-        # Method 4: Fallback to npx asar
-        if [[ -z "$version" && -f "$dir/resources/app.asar" ]] && command -v npx >/dev/null 2>&1; then
-            local tmp_dir
-            tmp_dir=$(mktemp -d)
-            if (cd "$tmp_dir" && npx --yes asar extract-file "$dir/resources/app.asar" package.json >/dev/null 2>&1); then
-                version=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$tmp_dir/package.json" 2>/dev/null | head -n1 || true)
-            fi
-            rm -rf "$tmp_dir"
-        fi
+detect_current_version() {
+    local ver
+    ver=$(detect_version_in_dir "$INSTALL_DIR")
+    if [[ -n "$ver" ]]; then
+        echo "$ver"
+        return 0
+    fi
+    echo "unknown"
+}
 
-        [[ -n "$version" ]] && break
-    done
+# ==================== External Tool Compatibility Fix ====================
+# Antigravity-Manager & other tools expect a loose resources/app/package.json
+ensure_package_json_metadata() {
+    local target_dir="$1"
+    local version="$2"
 
-    echo "${version:-unknown}"
+    if [[ -d "$target_dir" && -n "$version" && "$version" != "unknown" ]]; then
+        mkdir -p "$target_dir/resources/app"
+        cat > "$target_dir/resources/app/package.json" <<EOF
+{
+  "name": "antigravity",
+  "productName": "Antigravity",
+  "version": "$version",
+  "description": "Antigravity - Agentic Desktop Application"
+}
+EOF
+        log_ok "Synchronized resources/app/package.json metadata (compatible with Antigravity-Manager)."
+    fi
 }
 
 # ==================== Manifest & Version Lookup ====================
@@ -354,12 +401,18 @@ setup_cli_and_desktop() {
     mkdir -p "$DESKTOP_DIR"
     local desktop_file="$DESKTOP_DIR/antigravity.desktop"
 
+    local exec_cmd="$INSTALL_DIR/antigravity %U"
+    if [[ "$GLOBAL_MODE" == false ]]; then
+        # In non-root user mode, SUID chrome-sandbox cannot be configured, so use --no-sandbox
+        exec_cmd="$INSTALL_DIR/antigravity --no-sandbox %U"
+    fi
+
     cat > "$desktop_file" <<EOF
 [Desktop Entry]
 Name=Antigravity
 GenericName=Agentic Desktop
 Comment=Google Antigravity 2.0 Agentic Desktop
-Exec=$INSTALL_DIR/antigravity --no-sandbox %U
+Exec=$exec_cmd
 Icon=antigravity
 Type=Application
 Terminal=false
@@ -374,8 +427,8 @@ EOF
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
     fi
 
-    # Sync to ~/Desktop screen shortcut if Desktop folder exists
-    if [[ -d "$HOME/Desktop" ]]; then
+    # Sync to ~/Desktop screen shortcut if Desktop folder exists (in user mode)
+    if [[ "$GLOBAL_MODE" == false && -d "$HOME/Desktop" ]]; then
         cp -f "$desktop_file" "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
         chmod +x "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
         if command -v gio >/dev/null 2>&1; then
@@ -383,16 +436,26 @@ EOF
         fi
     fi
 
-    # 2. CLI Wrapper in ~/.local/bin/antigravity
-    if mkdir -p "$BIN_DIR" 2>/dev/null; then
-        local bin_file="$BIN_DIR/antigravity"
-        if cat > "$bin_file" 2>/dev/null <<EOF
+    # 2. CLI Executable / Wrapper Setup
+    mkdir -p "$BIN_DIR" 2>/dev/null || true
+    local bin_file="$BIN_DIR/antigravity"
+
+    if [[ "$GLOBAL_MODE" == true ]]; then
+        # For global installations, provide direct symlink
+        ln -sf "$INSTALL_DIR/antigravity" "$bin_file"
+
+        # Integrate with Debian/Ubuntu update-alternatives if available
+        if command -v update-alternatives >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
+            update-alternatives --install /usr/bin/antigravity antigravity "$INSTALL_DIR/antigravity" 100 2>/dev/null || true
+            update-alternatives --set antigravity "$INSTALL_DIR/antigravity" 2>/dev/null || true
+        fi
+    else
+        # For user-level installations, provide wrapper script ensuring proper flags
+        cat > "$bin_file" 2>/dev/null <<EOF
 #!/usr/bin/env bash
 exec "$INSTALL_DIR/antigravity" --no-sandbox "\$@"
 EOF
-        then
-            chmod +x "$bin_file" 2>/dev/null || true
-        fi
+        chmod +x "$bin_file" 2>/dev/null || true
     fi
 }
 
@@ -445,7 +508,11 @@ do_rollback() {
     mkdir -p "$(dirname "$INSTALL_DIR")"
     tar -xzf "$latest_backup" -C "$(dirname "$INSTALL_DIR")"
 
+    local restored_version
+    restored_version=$(detect_current_version)
+    ensure_package_json_metadata "$INSTALL_DIR" "$restored_version"
     setup_cli_and_desktop
+
     log_ok "Rollback complete! Successfully restored from $(basename "$latest_backup")"
     exit 0
 }
@@ -456,22 +523,54 @@ FORCE=false
 KEEP_BACKUP=false
 NON_INTERACTIVE=false
 ROLLBACK=false
+GLOBAL_MODE=false
 TARGET_VERSION=""
 CUSTOM_HASH=""
 
+# Auto-detect global mode if running as root
+if [[ $EUID -eq 0 ]]; then
+    GLOBAL_MODE=true
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -c|--check)       CHECK_ONLY=true; shift ;;
-        -f|--force)       FORCE=true; shift ;;
-        -k|--keep)        KEEP_BACKUP=true; shift ;;
-        -y|--yes)         NON_INTERACTIVE=true; shift ;;
-        -v|--version)     TARGET_VERSION="$2"; shift 2 ;;
-        --hash)           CUSTOM_HASH="$2"; shift 2 ;;
-        --rollback)       ROLLBACK=true; shift ;;
-        -h|--help)        usage ;;
+        -c|--check)           CHECK_ONLY=true; shift ;;
+        -g|--global|--system) GLOBAL_MODE=true; shift ;;
+        -f|--force)           FORCE=true; shift ;;
+        -k|--keep)            KEEP_BACKUP=true; shift ;;
+        -y|--yes)             NON_INTERACTIVE=true; shift ;;
+        -v|--version)         TARGET_VERSION="$2"; shift 2 ;;
+        --hash)               CUSTOM_HASH="$2"; shift 2 ;;
+        --rollback)           ROLLBACK=true; shift ;;
+        -h|--help)            usage ;;
         *) log_error "Unknown option: $1"; usage ;;
     esac
 done
+
+# Enforce root requirement for global installation
+if [[ "$GLOBAL_MODE" == true && $EUID -ne 0 ]]; then
+    log_error "Global installation requires root privileges. Please run with sudo: sudo $0 --global"
+    exit 1
+fi
+
+# ==================== Dynamic Paths Setup ====================
+if [[ "$GLOBAL_MODE" == true ]]; then
+    INSTALL_DIR="${ANTIGRAVITY_INSTALL_DIR:-/opt/Antigravity}"
+    ICON_DIR="$INSTALL_DIR/icons"
+    SYSTEM_ICON_DIR="/usr/share/icons/hicolor"
+    DESKTOP_DIR="/usr/share/applications"
+    BIN_DIR="/usr/local/bin"
+    BACKUP_DIR="${ANTIGRAVITY_BACKUP_DIR:-/var/backups/antigravity}"
+    CACHE_DIR="${ANTIGRAVITY_CACHE_DIR:-/var/cache/antigravity-updater}"
+else
+    INSTALL_DIR="${ANTIGRAVITY_INSTALL_DIR:-$HOME/.local/share/antigravity}"
+    ICON_DIR="$INSTALL_DIR/icons"
+    SYSTEM_ICON_DIR="$HOME/.local/share/icons/hicolor"
+    DESKTOP_DIR="$HOME/.local/share/applications"
+    BIN_DIR="$HOME/.local/bin"
+    BACKUP_DIR="${ANTIGRAVITY_BACKUP_DIR:-$HOME/.local/share/antigravity-backups}"
+    CACHE_DIR="${ANTIGRAVITY_CACHE_DIR:-$HOME/.cache/antigravity-updater}"
+fi
 
 if [[ "$ROLLBACK" == true ]]; then
     do_rollback
@@ -502,8 +601,15 @@ trap cleanup_handler EXIT INT TERM
 # ==================== Main Workflow ====================
 CURRENT_VERSION=$(detect_current_version)
 PLATFORM=$(detect_arch)
-log_info "System platform: $PLATFORM"
-log_info "Current installed version: $CURRENT_VERSION"
+log_info "Installation mode: $([ "$GLOBAL_MODE" == true ] && echo "Global (/opt/Antigravity)" || echo "User ($INSTALL_DIR)")"
+log_info "System platform:   $PLATFORM"
+log_info "Target install ver: $([ "$CURRENT_VERSION" != "unknown" ] && echo "$CURRENT_VERSION" || echo "Not installed in $INSTALL_DIR")"
+
+if [[ "$GLOBAL_MODE" == false && "$CURRENT_VERSION" == "unknown" && -f "/opt/Antigravity/antigravity" ]]; then
+    sys_ver=$(detect_version_in_dir "/opt/Antigravity")
+    log_info "System installation detected at /opt/Antigravity (version: ${sys_ver:-unknown})."
+    log_info "To manage/update system installation, run: sudo $0 --global"
+fi
 
 log_info "Checking auto-updater manifest..."
 
@@ -559,7 +665,7 @@ fi
 INSTALL_VERSION="$RESOLVED_VER"
 EXECUTION_ID="$RESOLVED_ID"
 
-log_info "Target version:  $INSTALL_VERSION (build: $EXECUTION_ID)"
+log_info "Target version:    $INSTALL_VERSION (build: $EXECUTION_ID)"
 
 # Version comparison check
 cmp_current=-1
@@ -567,8 +673,20 @@ if [[ "$CURRENT_VERSION" != "unknown" ]]; then
     compare_versions "$CURRENT_VERSION" "$INSTALL_VERSION" && cmp_current=0 || cmp_current=$?
 fi
 
+# Function to ensure system integrations even when version is already identical
+synchronize_integrations() {
+    ensure_package_json_metadata "$INSTALL_DIR" "$CURRENT_VERSION"
+    if [[ "$GLOBAL_MODE" == true && -f "$INSTALL_DIR/chrome-sandbox" && $EUID -eq 0 ]]; then
+        chown root:root "$INSTALL_DIR/chrome-sandbox" 2>/dev/null || true
+        chmod 4755 "$INSTALL_DIR/chrome-sandbox" 2>/dev/null || true
+        log_ok "Hardened chrome-sandbox permissions (SUID enabled)."
+    fi
+    setup_cli_and_desktop
+}
+
 if [[ "$cmp_current" -eq 0 && "$FORCE" == false ]]; then
     log_ok "Antigravity is already up to date (version: $CURRENT_VERSION)."
+    synchronize_integrations
     if [[ "$CHECK_ONLY" == true ]]; then
         exit 0
     fi
@@ -576,6 +694,7 @@ if [[ "$cmp_current" -eq 0 && "$FORCE" == false ]]; then
     exit 0
 elif [[ "$cmp_current" -eq 1 && "$FORCE" == false && -z "$TARGET_VERSION" ]]; then
     log_ok "Current version ($CURRENT_VERSION) is already newer than release channel ($INSTALL_VERSION)."
+    synchronize_integrations
     if [[ "$CHECK_ONLY" == true ]]; then
         exit 0
     fi
@@ -585,7 +704,7 @@ fi
 
 if [[ "$CHECK_ONLY" == true ]]; then
     if [[ "$CURRENT_VERSION" == "unknown" ]]; then
-        log_info "Antigravity is not currently installed. Latest available: $INSTALL_VERSION"
+        log_info "Antigravity is not currently installed in $INSTALL_DIR. Latest available: $INSTALL_VERSION"
     elif [[ "$cmp_current" -eq 2 ]]; then
         log_warn "New version available: $CURRENT_VERSION -> $INSTALL_VERSION"
         log_info "Run '$0' to install."
@@ -644,7 +763,7 @@ if [[ -d "$INSTALL_DIR" ]]; then
 fi
 
 # ==================== Install ====================
-log_info "Installing Antigravity $INSTALL_VERSION..."
+log_info "Installing Antigravity $INSTALL_VERSION into $INSTALL_DIR..."
 
 # Preserve existing custom icons if present
 TMP_ICON=""
@@ -668,8 +787,18 @@ fi
 chmod +x "$INSTALL_DIR/antigravity" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/chrome-sandbox" 2>/dev/null || true
 
+# Hardening chrome-sandbox with SUID root when in global mode
+if [[ "$GLOBAL_MODE" == true && -f "$INSTALL_DIR/chrome-sandbox" && $EUID -eq 0 ]]; then
+    chown root:root "$INSTALL_DIR/chrome-sandbox" 2>/dev/null || true
+    chmod 4755 "$INSTALL_DIR/chrome-sandbox" 2>/dev/null || true
+    log_ok "Hardened chrome-sandbox permissions (SUID enabled)."
+fi
+
 # Write version file
 echo "$INSTALL_VERSION" > "$INSTALL_DIR/.version"
+
+# Ensure resources/app/package.json exists for Antigravity-Manager & external tools
+ensure_package_json_metadata "$INSTALL_DIR" "$INSTALL_VERSION"
 
 # Extract icon if missing
 extract_app_icon
@@ -686,17 +815,18 @@ if [[ -x "$INSTALL_DIR/antigravity" ]]; then
     log_ok "=========================================="
     log_ok "  Antigravity $INSTALL_VERSION successfully installed!"
     log_ok "=========================================="
-    log_info "Installation:  $INSTALL_DIR"
-    log_info "CLI Command:   $BIN_DIR/antigravity"
-    log_info "Desktop Entry: $DESKTOP_DIR/antigravity.desktop"
-    log_info "App Icon:      $SYSTEM_ICON_DIR/.../antigravity.png"
+    log_info "Installation Mode: $([ "$GLOBAL_MODE" == true ] && echo "Global (FHS Standard)" || echo "User Space")"
+    log_info "Installation Dir:  $INSTALL_DIR"
+    log_info "CLI Command:       $BIN_DIR/antigravity"
+    log_info "Desktop Entry:     $DESKTOP_DIR/antigravity.desktop"
+    log_info "App Icon:          $SYSTEM_ICON_DIR/.../antigravity.png"
     echo ""
     log_info "You can launch Antigravity from your Application Menu or by running:"
     log_info "  antigravity"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
         echo ""
         log_warn "Note: '$BIN_DIR' is not in your current PATH."
-        log_warn "Add it to ~/.bashrc: export PATH=\"\$HOME/.local/bin:\$PATH\""
+        log_warn "Add it to ~/.bashrc: export PATH=\"$BIN_DIR:\$PATH\""
     fi
 else
     log_error "Installation verification failed. Executable not found."
