@@ -1,0 +1,10 @@
+name = "scripts-proxy"
+main = "worker/index.js"
+compatibility_date = "2024-10-01"
+
+[observability]
+enabled = true
+
+[[routes]]
+pattern = "scripts.hhk.my.id"
+custom_domain = true
