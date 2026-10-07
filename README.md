@@ -10,21 +10,22 @@ A curated collection of developer installation, maintenance, and automation scri
 
 ## ⚡ Quick One-Line Execution
 
-Run any script instantly directly from your terminal without cloning the repository:
+Run any script instantly directly from your terminal using our short URL proxy (`scripts.hhk.my.id`):
 
 ```bash
 # 🚀 Google Antigravity 2.0 (Agentic Desktop)
-curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/antigravity | bash
+curl -fsSL https://scripts.hhk.my.id/antigravity | bash
 
 # 🐹 Go Compiler & Version Manager
-curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/go | bash
+curl -fsSL https://scripts.hhk.my.id/go | bash
 
 # ⚡ Hugo Extended Installer (with Sass/SCSS)
-curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/gohugo | bash -s -- --extended
+curl -fsSL https://scripts.hhk.my.id/gohugo | bash -s -- --extended
 ```
 
 > **Tip:** You can pass command-line arguments to one-liners using `bash -s -- [OPTIONS]`  
-> (e.g. `curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/antigravity | bash -s -- --check`).
+> (e.g. `curl -fsSL https://scripts.hhk.my.id/antigravity | bash -s -- --check`).  
+> *Fallback raw GitHub URL:* `https://raw.githubusercontent.com/hhkmy/scripts/main/<script>`
 
 ---
 
@@ -42,6 +43,10 @@ curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/gohugo | bash -s
   Fast installer and updater for Hugo static site generator supporting Standard, Extended (with Sass/SCSS), and Extended with Deploy releases.  
   👉 [Usage Guide & Flags](#3-hugo-extended-installer-gohugo)
 
+- 🌐 **[`worker/`](./worker)** &nbsp; [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?style=flat-square&logo=cloudflare)](#)  
+  High-performance Edge Reverse Proxy powering `https://scripts.hhk.my.id`. Features intelligent User-Agent routing, CLI catalog banners for terminal clients, and edge caching.  
+  👉 [Worker Guide](#4-edge-proxy-worker-scripts-hub)
+
 ---
 
 ## 🚀 Script Usage & Details
@@ -52,7 +57,7 @@ Automated installation and update tool for Google Antigravity 2.0 (Agentic Deskt
 
 **One-line command:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/antigravity | bash
+curl -fsSL https://scripts.hhk.my.id/antigravity | bash
 ```
 
 **Local execution:**
@@ -94,7 +99,7 @@ Quickly install or update the latest stable Go compiler.
 
 **One-line command:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/go | bash
+curl -fsSL https://scripts.hhk.my.id/go | bash
 ```
 
 **Local execution:**
@@ -116,7 +121,7 @@ Installs or updates Hugo static site generator directly from official GitHub rel
 
 **One-line command:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hhkmy/scripts/main/gohugo | bash -s -- --extended
+curl -fsSL https://scripts.hhk.my.id/gohugo | bash -s -- --extended
 ```
 
 **Local execution:**
@@ -135,6 +140,18 @@ chmod +x gohugo
 # Force reinstall
 ./gohugo --force
 ```
+
+---
+
+### 4. Edge Proxy Worker (Scripts Hub)
+
+The `worker/` directory contains the Cloudflare Worker running at `https://scripts.hhk.my.id`.
+
+- **Plain-Text Script Delivery**: Serves files directly with `Content-Type: text/plain; charset=utf-8` without requiring HTTP 302 redirects.
+- **CLI Discovery**: Running `curl https://scripts.hhk.my.id` displays an interactive script catalog directly inside the terminal.
+- **Web Redirect**: Browsing to `https://scripts.hhk.my.id` in a web browser redirects seamlessly to this GitHub repository.
+- **Edge Caching**: Built-in 5-minute CDN caching prevents upstream GitHub rate limits.
+- **CI/CD Deployment**: Automatic deployment via `.github/workflows/deploy-worker.yml` on push.
 
 ---
 
