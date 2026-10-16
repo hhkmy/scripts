@@ -3,3 +3,21 @@
 .DS_Store
 *.swp
 *~
+
+# Dependencies & Environments
+node_modules/
+**/node_modules/
+venv/
+.venv/
+**/venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+
+# Cloudflare & Wrangler
+.wrangler/
+.dev.vars*
+
+# Environment
+.env*
+!.env.example

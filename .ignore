@@ -1,0 +1,20 @@
+# Virtual Environment & Python Caches
+venv/
+.venv/
+**/venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+
+# Node & Cloudflare Worker
+node_modules/
+**/node_modules/
+.wrangler/
+.dev.vars*
+
+# Logs & Temporary files
+*.tmp
+*.log
+.DS_Store
+*.swp
+*~
